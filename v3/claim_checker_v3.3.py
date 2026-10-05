@@ -1,0 +1,1894 @@
+"""
+YouTube Claim Checker v3.3
+Logic Đồng Bộ Hoàn Toàn - OCR và Text Input sử dụng cùng 1 pipeline
+
+Author: AI Assistant
+Version: 3.1.0
+Date: 2024
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, scrolledtext, messagebox
+import re
+from datetime import timedelta
+from pathlib import Path
+import pytesseract
+from PIL import Image, ImageGrab, ImageEnhance, ImageFilter
+import os
+import difflib
+
+
+# ============================================================================
+# UNIFIED CLAIM PARSER - Core Logic Module
+# ============================================================================
+
+class UnifiedClaimParser:
+    """
+    Parser thống nhất cho cả OCR và Text Input
+    Đảm bảo logic xử lý 100% giống nhau
+    """
+    
+    def __init__(self):
+        # ✅ CHUNG - Bộ patterns MỞ RỘNG cho YouTube
+        self.timestamp_patterns = [
+            # === PATTERNS CŨ (giữ nguyên) ===
+            r'(\d{1,2}):(\d{2}):(\d{2})\s*[——–\-]\s*(\d{1,2}):(\d{2}):(\d{2})',
+            r'(\d{1,2}):(\d{2}):(\d{2})\s+[——–\-]\s+(\d{1,2}):(\d{2}):(\d{2})',
+            r'(\d{1,2}):(\d{2}):(\d{2})[——–\-](\d{1,2}):(\d{2}):(\d{2})',
+            
+            # === PATTERNS MỚI cho YouTube ===
+            # Pattern 4: YouTube với | separator và em dash
+            r'(\d{1,2}):(\d{2}):(\d{2})\s*[——–\-]\s*(\d{1,2}):(\d{2}):(\d{2})\s*\|',
+            
+            # Pattern 5: Timestamp dính liền hoàn toàn (không space, không separator)
+            r'(\d{1,2}):(\d{2}):(\d{2})([——–\-])(\d{1,2}):(\d{2}):(\d{2})([——–\-])(\d{1,2}):(\d{2}):(\d{2})',
+            
+            # Pattern 6: Format ngắn MM:SS (không có giờ)
+            r'(\d{1,2}):(\d{2})\s*[——–\-]\s*(\d{1,2}):(\d{2})',
+            
+            # Pattern 7: Có thể có space hoặc không có space sau dấu gạch
+            r'(\d{1,2}):(\d{2}):(\d{2})[——–\-]\s*(\d{1,2}):(\d{2}):(\d{2})',
+        ]
+        
+        # ✅ Noise patterns (giữ nguyên + thêm)
+        self.noise_patterns = [
+            r'Nội dung được tìm thấy trong',
+            r'Nội dung',
+            r'được tìm thấy',
+            r'Content found in',
+            r'Loại nội dung',
+            r'Video sử dụng giai điệu',
+            r'Các bên xác nhận',
+            r'Giai điệu hoặc bài hát',
+        ]
+    
+    def normalize_text(self, text, source_type="unknown"):
+        """
+        ✅ v3.3: NÂNG CẤP - Xử lý đặc biệt cho YouTube screenshots
+        
+        Args:
+            text: Raw text từ OCR hoặc user paste
+            source_type: "ocr" hoặc "text"
+            
+        Returns:
+            Normalized text
+        """
+        # BƯỚC 1: Loại bỏ ALL noise text
+        for pattern in self.noise_patterns:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+        
+        # BƯỚC 2: Chuẩn hóa Unicode dashes về hyphen thống nhất
+        text = text.replace('\u2014', '-')  # Em dash
+        text = text.replace('\u2013', '-')  # En dash  
+        text = text.replace('\u2012', '-')  # Figure dash
+        text = text.replace('—', '-')       # Em dash (visual)
+        text = text.replace('–', '-')       # En dash (visual)
+        
+        # ✅ BƯỚC 3: XỬ LÝ TIMESTAMPS DÍNH LIỀN - NÂNG CẤP
+        # Case: "0:17 — 4:151:54:41 — 1:57:27" → "0:17 — 4:15 | 1:54:41 — 1:57:27"
+        
+        # Pattern: timestamp kết thúc ngay trước timestamp bắt đầu (không space)
+        # Tìm: "SS" + "H:MM:SS" → Thêm " | " ở giữa
+        text = re.sub(
+            r'(\d{2})(\d{1,2}:\d{2}:\d{2})',
+            r'\1 | \2',
+            text
+        )
+        
+        # Chạy lại để catch các case bị miss
+        text = re.sub(
+            r'(\d{2})(\d{1,2}:\d{2}:\d{2})',
+            r'\1 | \2',
+            text
+        )
+        
+        # BƯỚC 4: Chuẩn hóa whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        # BƯỚC 5: Clean up pipes thừa
+        text = re.sub(r'\|\s*\|', '|', text)  # Remove double pipes
+        text = re.sub(r'^\s*\|\s*', '', text)  # Remove leading pipe
+        text = re.sub(r'\s*\|\s*$', '', text)  # Remove trailing pipe
+        
+        return text.strip()
+    
+    def extract_song_name(self, text, source_type="unknown"):
+        """
+        ✅ v3.3: Extract tên bài hát - HỖ TRỢ FORMAT YOUTUBE
+        
+        Format YouTube:
+        Tên Bài Hát
+        Nội dung được tìm thấy trong
+        0:17 — 4:15...
+        
+        Returns:
+            (song_name, song_confidence)
+        """
+        lines = text.split('\n')
+        
+        # ✅ STRATEGY 1: Tìm dòng TRƯỚC "Nội dung được tìm thấy trong"
+        for i, line in enumerate(lines):
+            if 'nội dung' in line.lower() or 'content found' in line.lower():
+                # Lấy dòng TRƯỚC đó làm tên bài
+                if i > 0:
+                    song_name = lines[i-1].strip()
+                    if len(song_name) >= 3 and not re.search(r'^\d{1,2}:\d{2}', song_name):
+                        if source_type == "text":
+                            return (song_name, 100)
+                        else:
+                            return (song_name, 85)
+        
+        # ✅ STRATEGY 2: Tìm dòng đầu tiên KHÔNG phải noise/timestamp
+        for line in lines[:20]:  # Check 20 dòng đầu
+            clean_line = line.strip()
+            
+            # Bỏ qua dòng trống hoặc quá ngắn
+            if len(clean_line) < 3:
+                continue
+            
+            # Bỏ qua dòng chỉ chứa timestamp
+            if re.search(r'^\d{1,2}:\d{2}:\d{2}', clean_line):
+                continue
+            
+            # Bỏ qua noise text
+            if any(noise in clean_line.lower() for noise in [
+                'nội dung', 'được tìm thấy', 'content found', 
+                'loại nội dung', 'các bên', 'giai điệu'
+            ]):
+                continue
+            
+            # Bỏ qua dòng toàn dấu =, -
+            if re.match(r'^[=\-\s]{5,}$', clean_line):
+                continue
+            
+            # ✅ ĐÂY LÀ TÊN BÀI HÁT
+            if source_type == "text":
+                return (clean_line, 100)
+            else:
+                return (clean_line, 75)
+        
+        return ("Unknown", 0)
+    
+    def extract_timestamps(self, text):
+        """
+        ✅ v3.3: NÂNG CẤP - Extract timestamps với YOUTUBE support
+        
+        Returns:
+            List of (start_seconds, end_seconds) tuples
+        """
+        timestamps = []
+        
+        # BƯỚC 1: Thử TẤT CẢ patterns
+        for pattern_idx, pattern in enumerate(self.timestamp_patterns):
+            matches = re.findall(pattern, text)
+            
+            for match in matches:
+                try:
+                    # Handle different pattern formats
+                    if len(match) == 6:  # Standard H:M:S - H:M:S
+                        start_h, start_m, start_s, end_h, end_m, end_s = map(int, match)
+                    
+                    elif len(match) == 4:  # Short format M:S - M:S
+                        start_m, start_s, end_m, end_s = map(int, match)
+                        start_h = 0
+                        end_h = 0
+                    
+                    elif len(match) > 6:  # Complex pattern with extra captures
+                        # Extract only the numeric parts
+                        numbers = [int(x) for x in match if x.isdigit() or (isinstance(x, str) and x.replace(':', '').isdigit())]
+                        if len(numbers) >= 6:
+                            start_h, start_m, start_s = numbers[0:3]
+                            end_h, end_m, end_s = numbers[3:6]
+                        else:
+                            continue
+                    else:
+                        continue
+                    
+                    start_seconds = start_h * 3600 + start_m * 60 + start_s
+                    end_seconds = end_h * 3600 + end_m * 60 + end_s
+                    
+                    # ✅ VALIDATION CHUNG
+                    if not self._is_valid_timestamp(start_seconds, end_seconds):
+                        continue
+                    
+                    timestamps.append((start_seconds, end_seconds))
+                    
+                except (ValueError, IndexError) as e:
+                    continue
+        
+        # BƯỚC 2: Xử lý case đặc biệt - timestamps nằm trên nhiều dòng
+        # VD: "2:34:30 -\n2:37:08"
+        lines = text.split('\n')
+        for i in range(len(lines) - 1):
+            combined = lines[i].strip() + ' ' + lines[i+1].strip()
+            for pattern in self.timestamp_patterns:
+                matches = re.findall(pattern, combined)
+                for match in matches:
+                    try:
+                        if len(match) == 6:
+                            start_h, start_m, start_s, end_h, end_m, end_s = map(int, match)
+                            start_seconds = start_h * 3600 + start_m * 60 + start_s
+                            end_seconds = end_h * 3600 + end_m * 60 + end_s
+                            
+                            if self._is_valid_timestamp(start_seconds, end_seconds):
+                                timestamps.append((start_seconds, end_seconds))
+                    except:
+                        continue
+        
+        # BƯỚC 3: Loại bỏ duplicates và sort
+        timestamps = list(set(timestamps))
+        timestamps.sort(key=lambda x: x[0])
+        
+        # BƯỚC 4: Merge timestamps gần nhau (tolerance 3 giây)
+        merged_timestamps = []
+        for ts in timestamps:
+            if not merged_timestamps:
+                merged_timestamps.append(ts)
+            else:
+                last = merged_timestamps[-1]
+                # Nếu gần nhau, chỉ giữ 1
+                if abs(ts[0] - last[0]) <= 3 and abs(ts[1] - last[1]) <= 3:
+                    continue
+                merged_timestamps.append(ts)
+        
+        return merged_timestamps
+    
+    def _is_valid_timestamp(self, start, end):
+        """
+        ✅ VALIDATION CHUNG cho timestamps
+        """
+        # Start phải < End
+        if start >= end:
+            return False
+        
+        # Duration phải hợp lý: 1 giây đến 4 giờ
+        duration = end - start
+        if duration < 1 or duration > 14400:
+            return False
+        
+        # Timestamps không được âm
+        if start < 0 or end < 0:
+            return False
+        
+        return True
+    
+    def parse_claims(self, raw_data, source_type, source_name="Unknown"):
+        """
+        ✅ PIPELINE CHÍNH - THỐNG NHẤT CHO TẤT CẢ NGUỒN
+        
+        Args:
+            raw_data: Text từ OCR hoặc user paste
+            source_type: "ocr" hoặc "text"
+            source_name: Tên nguồn (file name hoặc "Text Input")
+            
+        Returns:
+            List of claim dictionaries
+        """
+        claims = []
+        
+        # BƯỚC 1: Normalize
+        normalized_text = self.normalize_text(raw_data, source_type)
+        
+        # BƯỚC 2: Extract song name
+        song_name, song_confidence = self.extract_song_name(normalized_text, source_type)
+        
+        # BƯỚC 3: Extract timestamps
+        timestamps = self.extract_timestamps(normalized_text)
+        
+        # BƯỚC 4: Tạo claims với metadata đồng nhất
+        for start, end in timestamps:
+            claim = {
+                'song': song_name,
+                'start': start,
+                'end': end,
+                'duration': end - start,
+                'source': source_name,
+                'source_type': source_type,
+                'confidence': 100 if source_type == "text" else song_confidence,
+                'song_confidence': song_confidence
+            }
+            claims.append(claim)
+        
+        return claims
+    
+    @staticmethod
+    def format_time(seconds):
+        """Format seconds to HH:MM:SS"""
+        return str(timedelta(seconds=seconds))
+    
+    @staticmethod
+    def format_claims_by_song(claims, numbered=False):
+        """
+        ✅ FORMAT OUTPUT CHUẨN - Mỗi bài 1 dòng
+        """
+        songs = {}
+        
+        for claim in claims:
+            song = claim['song']
+            if song not in songs:
+                songs[song] = []
+            
+            time_range = f"{UnifiedClaimParser.format_time(claim['start'])} – {UnifiedClaimParser.format_time(claim['end'])}"
+            songs[song].append(time_range)
+        
+        # Format output
+        output_lines = []
+        for idx, (song_name, time_ranges) in enumerate(sorted(songs.items()), 1):
+            if numbered:
+                line = f"{idx}. {song_name}: {' | '.join(time_ranges)}"
+            else:
+                line = f"{song_name}: {' | '.join(time_ranges)}"
+            output_lines.append(line)
+        
+        # ✅ Join với newline
+        return "\n".join(output_lines)
+
+
+# ============================================================================
+# MAIN APPLICATION
+# ============================================================================
+
+class ClaimCheckerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("YouTube Claim Checker v3.3 - Logic Đồng Bộ Hoàn Toàn")
+        self.root.geometry("1400x900")
+        
+        # Configure Tesseract path for Windows
+        if os.name == 'nt':
+            tesseract_paths = [
+                r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+                r'C:\Users\Linh\AppData\Local\Programs\Tesseract-OCR\tesseract.exe'
+            ]
+            for path in tesseract_paths:
+                if os.path.exists(path):
+                    pytesseract.pytesseract.tesseract_cmd = path
+                    break
+        
+        # ✅ KHỞI TẠO UNIFIED PARSER
+        self.claim_parser = UnifiedClaimParser()
+        
+        # Data storage
+        self.tracklist = []
+        self.claims = []
+        self.results = []
+        self.pasted_images = []
+        self.ambiguous_claims = []
+        self.auto_accepted_claims = []
+        self.input_mode = tk.StringVar(value="image")
+        
+        self.setup_ui()
+        self.setup_paste_handler()
+    
+    def setup_ui(self):
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        title_label = ttk.Label(main_frame, text="YOUTUBE CLAIM CHECKER v3.3 - LOGIC ĐỒNG BỘ", 
+                               font=('Arial', 16, 'bold'))
+        title_label.grid(row=0, column=0, columnspan=3, pady=10)
+        
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        self.main_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.main_tab, text="Kiểm Tra Claims")
+        self.setup_main_tab()
+        
+        self.review_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.review_tab, text="Review Claims (0)")
+        self.setup_review_tab()
+        
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(1, weight=1)
+    
+    def setup_main_tab(self):
+        # File input section
+        input_frame = ttk.LabelFrame(self.main_tab, text="1. Chọn File Tracklist", padding="10")
+        input_frame.grid(row=0, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        
+        ttk.Label(input_frame, text="File TXT (Tracklist):").grid(row=0, column=0, sticky=tk.W)
+        self.txt_path = tk.StringVar()
+        ttk.Entry(input_frame, textvariable=self.txt_path, width=60).grid(row=0, column=1, padx=5)
+        ttk.Button(input_frame, text="Chọn TXT", command=self.load_txt).grid(row=0, column=2)
+        
+        # Input mode selection
+        mode_frame = ttk.LabelFrame(self.main_tab, text="2. Chọn Phương Thức Nhập Claim", padding="10")
+        mode_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        
+        ttk.Radiobutton(mode_frame, text="📷 Nhập từ ảnh (OCR)", 
+                       variable=self.input_mode, value="image",
+                       command=self.toggle_input_mode).grid(row=0, column=0, padx=10, pady=5)
+        ttk.Radiobutton(mode_frame, text="📝 Nhập từ text (paste)", 
+                       variable=self.input_mode, value="text",
+                       command=self.toggle_input_mode).grid(row=0, column=1, padx=10, pady=5)
+        
+        # Image input section
+        self.image_frame = ttk.LabelFrame(self.main_tab, text="Nhập Claims từ Ảnh", padding="10")
+        self.image_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        
+        ttk.Label(self.image_frame, text="Ảnh Claim:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.img_count = tk.StringVar(value="0 ảnh")
+        ttk.Label(self.image_frame, textvariable=self.img_count).grid(row=0, column=1, sticky=tk.W)
+        
+        img_btn_frame = ttk.Frame(self.image_frame)
+        img_btn_frame.grid(row=0, column=2)
+        ttk.Button(img_btn_frame, text="🖼️ Chọn File", command=self.load_images).pack(side=tk.LEFT, padx=2)
+        ttk.Button(img_btn_frame, text="📋 Paste (Ctrl+V)", command=self.paste_image).pack(side=tk.LEFT, padx=2)
+        ttk.Button(img_btn_frame, text="🗑️ Xóa", command=self.clear_images).pack(side=tk.LEFT, padx=2)
+        
+        # ✅ THÊM BUTTON MỚI:
+        ttk.Button(img_btn_frame, text="🐛 Debug OCR", command=self.debug_last_image).pack(side=tk.LEFT, padx=2)
+        
+        # Text input section
+        self.text_frame = ttk.LabelFrame(self.main_tab, text="Nhập Claims từ Text", padding="10")
+        self.text_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        self.text_frame.grid_remove()
+        
+        # Header với nút Paste
+        text_header_frame = ttk.Frame(self.text_frame)
+        text_header_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+
+        ttk.Label(text_header_frame, text="Paste text claim vào đây (có thể paste nhiều lần):").pack(side=tk.LEFT)
+        ttk.Button(text_header_frame, text="📋 Paste", command=self.paste_text_claim).pack(side=tk.LEFT, padx=10)
+
+        self.text_input = scrolledtext.ScrolledText(self.text_frame, width=100, height=8, 
+                                                    font=('Consolas', 9))
+        self.text_input.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        text_btn_frame = ttk.Frame(self.text_frame)
+        text_btn_frame.grid(row=2, column=0, pady=5)
+        ttk.Button(text_btn_frame, text="➕ Thêm Claims", command=self.add_text_claims).pack(side=tk.LEFT, padx=2)
+        ttk.Button(text_btn_frame, text="🔄 Sắp Xếp Text", command=self.sort_text_input).pack(side=tk.LEFT, padx=2)
+        ttk.Button(text_btn_frame, text="🗑️ Xóa Text", command=self.clear_text_input).pack(side=tk.LEFT, padx=2)
+        ttk.Button(text_btn_frame, text="🗑️ Xóa Tất Cả", command=self.clear_all_text_claims).pack(side=tk.LEFT, padx=2)
+        ttk.Button(text_btn_frame, text="📜 Xem Lịch Sử", command=self.view_text_history).pack(side=tk.LEFT, padx=2)
+        
+        ttk.Label(self.text_frame, text="Claims đã nhập:").grid(row=3, column=0, sticky=tk.W, pady=(10,0))
+        self.text_claims_display = scrolledtext.ScrolledText(
+            self.text_frame, 
+            width=100, 
+            height=10,  # ✅ Tăng height để hiển thị nhiều dòng hơn
+            font=('Consolas', 9), 
+            wrap=tk.WORD,  # ✅ THÊM: Word wrap
+            state='disabled'
+        )
+        self.text_claims_display.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        # Process button
+        ttk.Button(self.main_tab, text="🔍 KIỂM TRA CLAIM", 
+                  command=self.process_claims).grid(row=3, column=0, columnspan=3, pady=10)
+        
+        # Results section
+        results_frame = ttk.LabelFrame(self.main_tab, text="3. Kết Quả Kiểm Tra", padding="10")
+        results_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        self.results_text = scrolledtext.ScrolledText(results_frame, width=160, height=25, 
+                                                      font=('Consolas', 9))
+        self.results_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        export_frame = ttk.Frame(results_frame)
+        export_frame.grid(row=1, column=0, pady=5)
+        ttk.Button(export_frame, text="💾 Xuất TXT", command=self.export_results).pack(side=tk.LEFT, padx=2)
+        ttk.Button(export_frame, text="📊 Xuất CSV", command=self.export_csv).pack(side=tk.LEFT, padx=2)
+        ttk.Button(export_frame, text="📄 Xuất Chi Tiết", command=self.export_detailed).pack(side=tk.LEFT, padx=2)
+        
+        self.main_tab.columnconfigure(0, weight=1)
+        self.main_tab.rowconfigure(2, weight=1)
+        self.main_tab.rowconfigure(4, weight=2)
+        results_frame.columnconfigure(0, weight=1)
+        results_frame.rowconfigure(0, weight=1)
+        self.text_frame.columnconfigure(0, weight=1)
+        self.text_frame.rowconfigure(1, weight=1)
+        self.text_frame.rowconfigure(4, weight=1)
+    
+    def toggle_input_mode(self):
+        mode = self.input_mode.get()
+        if mode == "image":
+            self.image_frame.grid()
+            self.text_frame.grid_remove()
+        else:
+            self.image_frame.grid_remove()
+            self.text_frame.grid()
+    
+    # ============================================
+    # ✅ TEXT INPUT - Sử dụng Unified Parser
+    # ============================================
+    
+    def add_text_claims(self):
+        """
+        ✅ v3.3: Text Input với DEDUPLICATION + Giữ nguyên text input + DEBUG
+        """
+        text = self.text_input.get("1.0", tk.END).strip()
+        
+        if not text:
+            messagebox.showwarning("Cảnh báo", "Vui lòng nhập text claim!")
+            return
+        
+        # ✅ Loại bỏ các dòng separator (=== và ---) 
+        # Giữ nguyên cấu trúc dữ liệu gốc
+        lines = text.split('\n')
+        filtered_lines = []
+        
+        for line in lines:
+            # Chỉ skip dòng toàn bộ là dấu =, -, hoặc khoảng trắng (tối thiểu 10 ký tự)
+            if re.match(r'^[=\-\s]{10,}$', line):
+                continue
+            filtered_lines.append(line)
+        
+        text = '\n'.join(filtered_lines)
+        
+        # ✅ DEBUG 1: In ra text sau khi filter
+        print("\n" + "="*80)
+        print("🔍 DEBUG 1: TEXT SAU KHI FILTER SEPARATORS")
+        print("="*80)
+        print(text[:800])  # In 800 ký tự đầu
+        print("="*80 + "\n")
+        
+        try:
+            # Đếm claims cũ trước khi thêm
+            old_count = len([c for c in self.claims if c.get('source_type') == 'text'])
+            
+            # ✅ GỌI UNIFIED PARSER
+            parsed_claims = self.claim_parser.parse_claims(
+                raw_data=text,
+                source_type="text",
+                source_name="Text Input"
+            )
+            
+            # ✅ DEBUG 2: In ra parsed claims
+            print("\n" + "="*80)
+            print(f"🔍 DEBUG 2: PARSED {len(parsed_claims)} CLAIMS TỪ TEXT")
+            print("="*80)
+            if parsed_claims:
+                for idx, claim in enumerate(parsed_claims[:10], 1):  # In 10 claims đầu
+                    print(f"{idx}. Song: {claim['song']}")
+                    print(f"   Time: {self.claim_parser.format_time(claim['start'])} → {self.claim_parser.format_time(claim['end'])}")
+                    print(f"   Confidence: {claim['confidence']}%")
+                    print()
+            else:
+                print("⚠️ KHÔNG TÌM THẤY CLAIM NÀO!")
+            print("="*80 + "\n")
+            
+            if not parsed_claims:
+                messagebox.showwarning("Cảnh báo", 
+                    "Không tìm thấy claim hợp lệ trong text!\n\n"
+                    "Kiểm tra Console (terminal) để xem debug info.")
+                return
+            
+            # ✅ DEDUPLICATION - Kiểm tra trùng lặp
+            new_claims_added = 0
+            duplicates_skipped = 0
+            
+            for new_claim in parsed_claims:
+                is_duplicate = False
+                
+                # Kiểm tra với tất cả claims đã có
+                for existing_claim in self.claims:
+                    # Chỉ so sánh với text claims
+                    if existing_claim.get('source_type') != 'text':
+                        continue
+                    
+                    # Điều kiện trùng: cùng bài + timestamps gần nhau (tolerance 3 giây)
+                    same_song = existing_claim['song'].strip().lower() == new_claim['song'].strip().lower()
+                    start_diff = abs(existing_claim['start'] - new_claim['start'])
+                    end_diff = abs(existing_claim['end'] - new_claim['end'])
+                    
+                    if same_song and start_diff <= 3 and end_diff <= 3:
+                        is_duplicate = True
+                        duplicates_skipped += 1
+                        print(f"⚠️ SKIP DUPLICATE: {new_claim['song']} - {self.claim_parser.format_time(new_claim['start'])}")
+                        break
+                
+                # Chỉ thêm nếu không trùng
+                if not is_duplicate:
+                    self.claims.append(new_claim)
+                    new_claims_added += 1
+            
+            # ✅ DEBUG 3: In ra kết quả deduplication
+            print("\n" + "="*80)
+            print(f"🔍 DEBUG 3: DEDUPLICATION RESULTS")
+            print("="*80)
+            print(f"✅ New claims added: {new_claims_added}")
+            print(f"⚠️ Duplicates skipped: {duplicates_skipped}")
+            print(f"📝 Total text claims: {len([c for c in self.claims if c.get('source_type') == 'text'])}")
+            print("="*80 + "\n")
+            
+            # ✅ Lưu history
+            if new_claims_added > 0:
+                self.save_text_claims_history()
+            
+            # ✅ Update display
+            self.update_text_claims_display()
+            
+            # ✅ KHÔNG XÓA text input - giữ nguyên để user có thể xem lại
+            # self.text_input.delete("1.0", tk.END)  # <-- COMMENTED OUT
+            
+            # Thông báo chi tiết
+            new_total = len([c for c in self.claims if c.get('source_type') == 'text'])
+            
+            message = f"✅ Đã thêm {new_claims_added} claims mới từ text!"
+            if duplicates_skipped > 0:
+                message += f"\n⚠️ Bỏ qua {duplicates_skipped} claims trùng lặp"
+            message += f"\n📝 Tổng cộng: {new_total} claims"
+            message += f"\n\n💡 Xem Console để kiểm tra chi tiết"
+            
+            messagebox.showinfo("Thành công", message)
+            
+        except Exception as e:
+            print("\n" + "="*80)
+            print("❌ DEBUG: ERROR")
+            print("="*80)
+            import traceback
+            traceback.print_exc()
+            print("="*80 + "\n")
+            
+            messagebox.showerror("Lỗi", f"Không thể parse text:\n{str(e)}")
+    
+    def update_text_claims_display(self):
+        """
+        ✅ v3.3: Hiển thị SẠCH - MỖI BÀI 1 DÒNG RIÊNG
+        """
+        self.text_claims_display.config(state='normal')
+        self.text_claims_display.delete("1.0", tk.END)
+        
+        text_claims = [c for c in self.claims if c.get('source_type') == 'text']
+        
+        if not text_claims:
+            self.text_claims_display.config(state='disabled')
+            self.img_count.set("0 claims từ text")
+            return
+        
+        # ✅ DEDUPLICATION
+        unique_claims = []
+        seen = set()
+        
+        for claim in text_claims:
+            start_rounded = (claim['start'] // 3) * 3
+            end_rounded = (claim['end'] // 3) * 3
+            key = (claim['song'].strip().lower(), start_rounded, end_rounded)
+            
+            if key not in seen:
+                seen.add(key)
+                unique_claims.append(claim)
+        
+        # ✅ GOM THEO BÀI HÁT
+        songs = {}
+        for claim in unique_claims:
+            song = claim['song']
+            if song not in songs:
+                songs[song] = []
+            
+            # Format timestamp với leading zeros
+            start_time = self.claim_parser.format_time(claim['start'])
+            end_time = self.claim_parser.format_time(claim['end'])
+            time_range = f"{start_time} – {end_time}"
+            songs[song].append(time_range)
+        
+        # ✅ INSERT TỪNG DÒNG - QUAN TRỌNG!
+        for idx, (song_name, time_ranges) in enumerate(sorted(songs.items()), 1):
+            # Tạo line với \n ở cuối
+            line = f"{idx}. {song_name}: {' | '.join(time_ranges)}\n"
+            # Insert vào display
+            self.text_claims_display.insert(tk.END, line)
+        
+        # Thống kê (nếu có deduplication)
+        if len(text_claims) > len(unique_claims):
+            stats = f"\nℹ️ Đã gộp {len(text_claims)} claims → {len(unique_claims)} unique claims\n"
+            self.text_claims_display.insert(tk.END, stats)
+        
+        self.text_claims_display.config(state='disabled')
+        
+        # Update counter
+        unique_songs = len(songs)
+        self.img_count.set(f"{len(unique_claims)} claims từ text ({unique_songs} bài)")
+
+    def save_text_claims_history(self):
+        """
+        ✅ v3.3: Lưu lịch sử text claims vào file tạm
+        Cho phép user xem lại những gì đã paste trước đó
+        """
+        text_claims = [c for c in self.claims if c.get('source_type') == 'text']
+        
+        if not text_claims:
+            return
+        
+        # Tạo folder lưu history
+        history_folder = Path.cwd() / "claim_history"
+        history_folder.mkdir(exist_ok=True)
+        
+        # Tạo file với timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        history_file = history_folder / f"text_claims_{timestamp}.txt"
+        
+        # Lưu formatted output
+        formatted_output = self.claim_parser.format_claims_by_song(text_claims, numbered=True)
+        
+        with open(history_file, 'w', encoding='utf-8-sig') as f:
+            f.write("="*80 + "\n")
+            f.write(f"TEXT CLAIMS HISTORY - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("="*80 + "\n\n")
+            f.write(formatted_output)
+            f.write(f"\n\n{'='*80}\n")
+            f.write(f"Total: {len(text_claims)} claims from {len(set(c['song'] for c in text_claims))} songs\n")
+
+    def view_text_history(self):
+        """
+        ✅ v3.3: Mở folder chứa lịch sử text claims
+        """
+        history_folder = Path.cwd() / "claim_history"
+        
+        if not history_folder.exists():
+            messagebox.showinfo("Thông báo", "Chưa có lịch sử nào được lưu!")
+            return
+        
+        history_files = list(history_folder.glob("text_claims_*.txt"))
+        
+        if not history_files:
+            messagebox.showinfo("Thông báo", "Chưa có lịch sử nào được lưu!")
+            return
+        
+        # Mở folder trong file explorer
+        import subprocess
+        import platform
+        
+        system = platform.system()
+        try:
+            if system == "Windows":
+                os.startfile(history_folder)
+            elif system == "Darwin":  # macOS
+                subprocess.Popen(["open", history_folder])
+            else:  # Linux
+                subprocess.Popen(["xdg-open", history_folder])
+            
+            messagebox.showinfo("Thành công", 
+                              f"✅ Đã mở folder lịch sử\n"
+                              f"📂 {history_folder}\n"
+                              f"📝 {len(history_files)} file(s)")
+        except Exception as e:
+            messagebox.showerror("Lỗi", f"Không thể mở folder:\n{str(e)}")
+    
+    def clear_text_input(self):
+        self.text_input.delete("1.0", tk.END)
+
+    def paste_text_claim(self):
+        """
+        ✅ v3.3: Paste text từ clipboard vào text input
+        """
+        try:
+            # Lấy text từ clipboard
+            clipboard_text = self.root.clipboard_get()
+            
+            if not clipboard_text or not clipboard_text.strip():
+                messagebox.showwarning("Clipboard Trống", "Không có text trong clipboard!")
+                return
+            
+            # Insert vào cuối text hiện tại (không xóa text cũ)
+            current_text = self.text_input.get("1.0", tk.END).strip()
+            
+            if current_text:
+                # Nếu đã có text, thêm separator
+                self.text_input.insert(tk.END, "\n\n" + "="*80 + "\n\n")
+            
+            self.text_input.insert(tk.END, clipboard_text)
+            
+            # Scroll xuống cuối
+            self.text_input.see(tk.END)
+            
+            messagebox.showinfo("Paste Thành Công", 
+                              f"✅ Đã paste {len(clipboard_text)} ký tự\n"
+                              f"📝 Nhấn 'Thêm Claims' để xử lý")
+            
+        except tk.TclError:
+            messagebox.showerror("Lỗi", "Không thể đọc clipboard!\n\nKhông có text trong clipboard.")
+        except Exception as e:
+            messagebox.showerror("Lỗi Paste", f"Không thể paste text!\n\n{str(e)}")
+
+    def sort_text_input(self):
+        """
+        ✅ v3.3: Sắp xếp text trong input box theo thứ tự thời gian
+        """
+        text = self.text_input.get("1.0", tk.END).strip()
+        
+        if not text:
+            messagebox.showinfo("Thông báo", "Không có text để sắp xếp!")
+            return
+        
+        try:
+            # Parse text thành claims tạm thời
+            temp_claims = self.claim_parser.parse_claims(
+                raw_data=text,
+                source_type="text",
+                source_name="Temp"
+            )
+            
+            if not temp_claims:
+                messagebox.showwarning("Cảnh báo", "Không tìm thấy timestamps để sắp xếp!")
+                return
+            
+            # Sắp xếp theo start time
+            sorted_claims = sorted(temp_claims, key=lambda x: x['start'])
+            
+            # Format lại thành text
+            formatted_lines = []
+            for claim in sorted_claims:
+                time_str = f"{self.claim_parser.format_time(claim['start'])} – {self.claim_parser.format_time(claim['end'])}"
+                formatted_lines.append(f"{claim['song']}: {time_str}")
+            
+            # Cập nhật text input
+            self.text_input.delete("1.0", tk.END)
+            self.text_input.insert("1.0", "\n".join(formatted_lines))
+            
+            messagebox.showinfo("Thành công", 
+                              f"✅ Đã sắp xếp {len(sorted_claims)} claims theo thời gian!")
+            
+        except Exception as e:
+            messagebox.showerror("Lỗi", f"Không thể sắp xếp text:\n{str(e)}")
+    
+    def clear_all_text_claims(self):
+        if not any(c.get('source_type') == 'text' for c in self.claims):
+            messagebox.showinfo("Thông báo", "Chưa có claim nào từ text")
+            return
+        
+        confirm = messagebox.askyesno("Xác nhận", "Xóa tất cả claims từ text?")
+        if confirm:
+            self.claims = [c for c in self.claims if c.get('source_type') != 'text']
+            self.update_text_claims_display()
+            messagebox.showinfo("Thành công", "Đã xóa tất cả claims từ text")
+    
+    # ============================================
+    # ✅ IMAGE/OCR INPUT - Sử dụng Unified Parser
+    # ============================================
+    
+    def setup_review_tab(self):
+        info_frame = ttk.LabelFrame(self.review_tab, text="Hướng Dẫn", padding="10")
+        info_frame.grid(row=0, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        
+        info_text = ("Claims được đánh dấu 'Cần Review' khi:\n"
+                    "• OCR confidence < 50% (rất thấp)\n"
+                    "• Timestamp có vấn đề (duration quá dài/ngắn bất thường)\n"
+                    "• Không tìm được file nào match trong tracklist\n"
+                    "Các claims khác đã được tự động chấp nhận.")
+        ttk.Label(info_frame, text=info_text, justify=tk.LEFT).pack()
+        
+        review_frame = ttk.LabelFrame(self.review_tab, text="Claims Cần Review", padding="10")
+        review_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        columns = ('claim_id', 'song', 'time_range', 'confidence', 'reason', 'matched_files')
+        self.review_tree = ttk.Treeview(review_frame, columns=columns, show='headings', height=15)
+        
+        self.review_tree.heading('claim_id', text='ID')
+        self.review_tree.heading('song', text='Tên Bài Hát')
+        self.review_tree.heading('time_range', text='Khoảng Thời Gian')
+        self.review_tree.heading('confidence', text='Confidence')
+        self.review_tree.heading('reason', text='Lý Do')
+        self.review_tree.heading('matched_files', text='Files Có Thể Match')
+        
+        self.review_tree.column('claim_id', width=50)
+        self.review_tree.column('song', width=250)
+        self.review_tree.column('time_range', width=150)
+        self.review_tree.column('confidence', width=100)
+        self.review_tree.column('reason', width=200)
+        self.review_tree.column('matched_files', width=250)
+        
+        self.review_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        scrollbar = ttk.Scrollbar(review_frame, orient=tk.VERTICAL, command=self.review_tree.yview)
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.review_tree.configure(yscrollcommand=scrollbar.set)
+        
+        action_frame = ttk.Frame(review_frame)
+        action_frame.grid(row=1, column=0, pady=10)
+        
+        ttk.Button(action_frame, text="✅ Chấp Nhận", command=self.accept_claim).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="❌ Loại Bỏ", command=self.reject_claim).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="✏️ Chỉnh Sửa", command=self.edit_claim).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="✅ Chấp Nhận Tất Cả", command=self.accept_all_claims).pack(side=tk.LEFT, padx=5)
+        ttk.Button(action_frame, text="🔄 Xử Lý Lại", command=self.reprocess_claims).pack(side=tk.LEFT, padx=5)
+        
+        self.review_tab.columnconfigure(0, weight=1)
+        self.review_tab.rowconfigure(1, weight=1)
+        review_frame.columnconfigure(0, weight=1)
+        review_frame.rowconfigure(0, weight=1)
+    
+    def setup_paste_handler(self):
+        self.root.bind('<Control-v>', lambda e: self.paste_image())
+        self.root.bind('<Control-V>', lambda e: self.paste_image())
+    
+    def load_txt(self):
+        filepath = filedialog.askopenfilename(
+            title="Chọn file TXT",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if filepath:
+            try:
+                self.txt_path.set(filepath)
+                self.parse_tracklist(filepath)
+                
+                unique_extensions = set(Path(t['filename']).suffix for t in self.tracklist)
+                ext_str = ", ".join(unique_extensions)
+                
+                messagebox.showinfo(
+                    "Thành công", 
+                    f"✅ Đã tải {len(self.tracklist)} bài hát từ tracklist\n\n"
+                    f"Định dạng: {ext_str}\n"
+                    f"Thời lượng: {self.claim_parser.format_time(self.tracklist[-1]['end'])}"
+                )
+            except Exception as e:
+                messagebox.showerror("Lỗi", f"Không thể tải file!\n\n{str(e)}")
+    
+    def load_images(self):
+        """
+        ✅ v3.3: FIX - Lưu ảnh vào pasted_images để debug
+        """
+        filepaths = filedialog.askopenfilenames(
+            title="Chọn ảnh claim",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg"), ("All files", "*.*")]
+        )
+        if filepaths:
+            success_count = 0
+            
+            for filepath in filepaths:
+                try:
+                    # ✅ FIX: Load và lưu ảnh
+                    img = Image.open(filepath)
+                    self.pasted_images.append(img)
+                    
+                    # Extract claims
+                    source_name = Path(filepath).name
+                    self.extract_claims_from_pil_image(img, source_name)
+                    
+                    success_count += 1
+                    
+                except Exception as e:
+                    print(f"❌ Error loading {filepath}: {e}")
+                    continue
+            
+            self.remove_duplicate_claims()
+            self.update_image_count()
+            
+            # ✅ Hiển thị thông tin chi tiết
+            if self.claims:
+                messagebox.showinfo(
+                    "Thành công", 
+                    f"✅ Đã tải {success_count} ảnh từ file\n"
+                    f"🎯 Phát hiện {len(self.claims)} claims\n\n"
+                    f"Click 'KIỂM TRA CLAIM' để tiếp tục."
+                )
+            else:
+                # ⚠️ Không tìm thấy claim
+                response = messagebox.askyesno(
+                    "⚠️ Không tìm thấy claim",
+                    f"Đã tải {success_count} ảnh nhưng OCR không phát hiện được claim.\n\n"
+                    f"Có thể do:\n"
+                    f"• Chất lượng ảnh thấp\n"
+                    f"• Text trong ảnh khó đọc\n"
+                    f"• Format không đúng\n\n"
+                    f"Bạn có muốn debug ảnh cuối cùng không?"
+                )
+                if response:
+                    self.debug_last_image()
+    
+    def paste_image(self):
+        if self.input_mode.get() == "text":
+            return
+        
+        try:
+            img = ImageGrab.grabclipboard()
+            
+            if img is None:
+                messagebox.showwarning("Clipboard Trống", "Không tìm thấy ảnh trong clipboard!")
+                return
+            
+            if isinstance(img, list):
+                if len(img) > 0:
+                    img = img[0]
+                else:
+                    return
+            
+            if not isinstance(img, Image.Image):
+                try:
+                    img = img.convert('RGB')
+                except:
+                    messagebox.showerror("Lỗi", "Dữ liệu clipboard không phải ảnh hợp lệ!")
+                    return
+            
+            self.pasted_images.append(img)
+            self.extract_claims_from_pil_image(img, f"Pasted_Image_{len(self.pasted_images)}")
+            
+            self.remove_duplicate_claims()
+            self.update_image_count()
+            
+            messagebox.showinfo("Paste Thành Công", f"✅ Đã paste ảnh #{len(self.pasted_images)}")
+            
+        except Exception as e:
+            messagebox.showerror("Lỗi Paste Ảnh", f"Không thể paste ảnh!\n\n{str(e)}")
+    
+    def clear_images(self):
+        if not self.claims and not self.pasted_images:
+            messagebox.showinfo("Thông báo", "Chưa có ảnh nào được tải")
+            return
+        
+        confirm = messagebox.askyesno("Xác nhận", "Xóa tất cả ảnh đã tải?")
+        if confirm:
+            self.claims = []
+            self.pasted_images = []
+            self.ambiguous_claims = []
+            self.auto_accepted_claims = []
+            self.update_image_count()
+            self.update_review_tab()
+            messagebox.showinfo("Thành công", "Đã xóa tất cả ảnh")
+
+    def debug_last_image(self):
+        """
+        ✅ v3.3: DEBUG - Test OCR với ảnh cuối cùng
+        """
+        if not self.pasted_images:
+            messagebox.showwarning(
+                "Cảnh báo", 
+                "Chưa có ảnh nào được load!\n\n"
+                "Vui lòng:\n"
+                "• Paste ảnh (Ctrl+V), HOẶC\n"
+                "• Chọn file ảnh"
+            )
+            return
+        
+        # Lấy ảnh cuối cùng
+        img = self.pasted_images[-1]
+        source_name = f"Debug_Image_{len(self.pasted_images)}"
+        
+        print("\n" + "="*80)
+        print("🐛 STARTING DEBUG MODE")
+        print("="*80)
+        
+        # Chạy debug với OUTPUT CHI TIẾT
+        self.debug_ocr_output(img, source_name)
+        
+        # Hiển thị hướng dẫn
+        messagebox.showinfo(
+            "Debug Complete",
+            f"✅ Đã debug ảnh #{len(self.pasted_images)}\n\n"
+            f"📊 Kiểm tra CONSOLE (terminal) để xem:\n"
+            f"• Raw OCR text\n"
+            f"• Normalized text\n"
+            f"• Extracted timestamps\n\n"
+            f"Nếu không thấy timestamps:\n"
+            f"→ Chất lượng ảnh quá thấp\n"
+            f"→ Thử copy text thay vì dùng ảnh"
+        )
+    
+    def update_image_count(self):
+        if self.input_mode.get() == "image":
+            unique_sources = len(set(c.get('source', '') for c in self.claims if c.get('source_type') != 'text'))
+            ocr_claims = len([c for c in self.claims if c.get('source_type') == 'ocr'])
+            self.img_count.set(f"{unique_sources} ảnh - {ocr_claims} claim")
+        else:
+            text_claims_count = len([c for c in self.claims if c.get('source_type') == 'text'])
+            self.img_count.set(f"{text_claims_count} claims từ text")
+    
+    def parse_tracklist(self, filepath):
+        self.tracklist = []
+        
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except:
+            try:
+                with open(filepath, 'r', encoding='utf-8-sig') as f:
+                    content = f.read()
+            except:
+                with open(filepath, 'r', encoding='latin-1') as f:
+                    content = f.read()
+        
+        audio_extensions = r'(wav|mp3|m4a|flac|ogg|aac|wma|opus|webm|aiff|ape)'
+        pattern = rf'│\s+(\d{{2}}:\d{{2}}:\d{{2}})\s+\|\s+(\d{{2}}:\d{{2}}:\d{{2}})\s+\|\s+(.+?)\.{audio_extensions}'
+        
+        matches = re.findall(pattern, content, re.IGNORECASE)
+        
+        if not matches:
+            pattern_alt = rf'(\d{{2}}:\d{{2}}:\d{{2}})\s+[|]\s+(\d{{2}}:\d{{2}}:\d{{2}})\s+[|]\s+(.+?)\.{audio_extensions}'
+            matches = re.findall(pattern_alt, content, re.IGNORECASE)
+        
+        for match in matches:
+            start, end, filename, extension = match
+            self.tracklist.append({
+                'start': self.parse_time(start),
+                'end': self.parse_time(end),
+                'filename': filename.strip() + '.' + extension
+            })
+        
+        if not self.tracklist:
+            raise ValueError("Không tìm thấy track nào trong file TXT.")
+    
+    def extract_claims_from_image(self, filepath):
+        try:
+            img = Image.open(filepath)
+            source_name = Path(filepath).name
+            self.extract_claims_from_pil_image(img, source_name)
+        except Exception as e:
+            print(f"Error: {e}")
+    
+    def extract_claims_from_pil_image(self, img, source_name):
+        """
+        ✅ v3.3: OCR với YOUTUBE PREPROCESSING + LOGGING
+        """
+        try:
+            print(f"\n{'='*80}")
+            print(f"🔍 Processing: {source_name}")
+            print(f"{'='*80}")
+            
+            # ✅ THÊM: YouTube-specific preprocessing
+            methods = [
+                ("YouTube Specific", self.preprocess_youtube_screenshot),
+                ("High Contrast", self.preprocess_method_1),
+                ("Moderate", self.preprocess_method_2),
+                ("Edge Enhance", self.preprocess_method_3)
+            ]
+            
+            all_claims = []
+            ocr_texts = []
+            
+            for method_name, method in methods:
+                print(f"\n🔄 Trying method: {method_name}")
+                
+                img_processed = method(img)
+                
+                try:
+                    # Config 1: Default (vie+eng+spa)
+                    text1 = pytesseract.image_to_string(
+                        img_processed, 
+                        lang='vie+eng+spa',
+                        config='--psm 6'
+                    )
+                    
+                    # Config 2: Single line mode
+                    text2 = pytesseract.image_to_string(
+                        img_processed,
+                        lang='eng',
+                        config='--psm 7'
+                    )
+                    
+                    # Config 3: Sparse text
+                    text3 = pytesseract.image_to_string(
+                        img_processed,
+                        lang='eng+spa',
+                        config='--psm 11'
+                    )
+                    
+                    combined_text = f"{text1}\n{text2}\n{text3}"
+                    ocr_texts.append((method_name, combined_text))
+                    
+                    print(f"   📝 OCR text length: {len(combined_text)} chars")
+                    
+                    # ✅ GỌI UNIFIED PARSER
+                    claims = self.claim_parser.parse_claims(
+                        raw_data=combined_text,
+                        source_type="ocr",
+                        source_name=source_name
+                    )
+                    
+                    if claims:
+                        print(f"   ✅ Found {len(claims)} claims!")
+                        for claim in claims:
+                            print(f"      • {claim['song']}: {self.claim_parser.format_time(claim['start'])} → {self.claim_parser.format_time(claim['end'])}")
+                    else:
+                        print(f"   ⚠️ No claims found")
+                    
+                    all_claims.extend(claims)
+                    
+                except Exception as e:
+                    print(f"   ❌ OCR error: {e}")
+                    continue
+            
+            # Debug: Nếu không tìm thấy claims, in ra sample text
+            if not all_claims:
+                print(f"\n{'⚠️'*40}")
+                print(f"⚠️ NO CLAIMS FOUND FOR: {source_name}")
+                print(f"{'⚠️'*40}")
+                
+                # In ra text từ method đầu tiên (YouTube specific)
+                if ocr_texts:
+                    method_name, text = ocr_texts[0]
+                    print(f"\n📝 Sample OCR output from '{method_name}':")
+                    print("-"*80)
+                    print(text[:800])  # In 800 ký tự đầu
+                    print("-"*80)
+                    
+                    # Thử normalize xem có gì không
+                    normalized = self.claim_parser.normalize_text(text, "ocr")
+                    print(f"\n✅ Normalized text:")
+                    print("-"*80)
+                    print(normalized[:500])
+                    print("-"*80)
+            
+            # Merge similar claims
+            self.merge_and_add_claims(all_claims)
+            
+            print(f"\n{'='*80}\n")
+            
+        except Exception as e:
+            print(f"❌ Error processing image {source_name}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def debug_ocr_output(self, img, source_name):
+        """
+        ✅ v3.3: DEBUG - Kiểm tra OCR output
+        
+        Chạy OCR và hiển thị kết quả để debug
+        """
+        print(f"\n{'='*80}")
+        print(f"DEBUG OCR: {source_name}")
+        print(f"{'='*80}")
+        
+        # Test với YouTube preprocessing
+        img_processed = self.preprocess_youtube_screenshot(img)
+        
+        try:
+            # OCR
+            text = pytesseract.image_to_string(
+                img_processed,
+                lang='eng+spa',
+                config='--psm 6'
+            )
+            
+            print("\n📝 RAW OCR TEXT:")
+            print("-"*80)
+            print(text)
+            print("-"*80)
+            
+            # Normalize
+            normalized = self.claim_parser.normalize_text(text, "ocr")
+            print("\n✅ NORMALIZED TEXT:")
+            print("-"*80)
+            print(normalized)
+            print("-"*80)
+            
+            # Extract timestamps
+            timestamps = self.claim_parser.extract_timestamps(normalized)
+            print(f"\n🎯 EXTRACTED TIMESTAMPS: {len(timestamps)}")
+            for idx, (start, end) in enumerate(timestamps, 1):
+                print(f"  {idx}. {self.claim_parser.format_time(start)} → {self.claim_parser.format_time(end)}")
+            
+            print(f"\n{'='*80}\n")
+            
+        except Exception as e:
+            print(f"❌ DEBUG ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def preprocess_youtube_screenshot(self, img):
+        """
+        ✅ v3.3: PREPROCESSING ĐẶC BIỆT cho YouTube screenshots
+        
+        Xử lý:
+        - Text xanh (#3EA6FF) trên nền đen
+        - Font nhỏ
+        - Nhiễu từ UI YouTube
+        
+        Returns:
+            Preprocessed image tối ưu cho OCR
+        """
+        # BƯỚC 1: Tăng kích thước để OCR đọc dễ hơn (scale 2x)
+        width, height = img.size
+        img = img.resize((width * 2, height * 2), Image.LANCZOS)
+        
+        # BƯỚC 2: Convert sang grayscale
+        img_gray = img.convert('L')
+        
+        # BƯỚC 3: INVERT colors (text xanh thành trắng, nền đen thành đen)
+        # YouTube: text sáng trên nền tối → Cần invert để OCR đọc tốt hơn
+        from PIL import ImageOps
+        img_inverted = ImageOps.invert(img_gray)
+        
+        # BƯỚC 4: Extreme contrast để làm rõ text
+        img_contrast = ImageEnhance.Contrast(img_inverted).enhance(3.0)
+        
+        # BƯỚC 5: Brightness để text trắng hơn
+        img_bright = ImageEnhance.Brightness(img_contrast).enhance(1.5)
+        
+        # BƯỚC 6: Sharpen để text rõ nét
+        img_sharp = ImageEnhance.Sharpness(img_bright).enhance(2.5)
+        
+        # BƯỚC 7: Binary threshold - chỉ giữ đen/trắng
+        threshold = 150
+        img_binary = img_sharp.point(lambda x: 255 if x > threshold else 0, mode='1')
+        
+        # BƯỚC 8: Denoise - Remove small noise
+        img_binary = img_binary.filter(ImageFilter.MedianFilter(size=3))
+        
+        return img_binary
+    
+    def preprocess_method_1(self, img):
+        """Method 1: High contrast + Sharpen"""
+        img_gray = img.convert('L')
+        img_contrast = ImageEnhance.Contrast(img_gray).enhance(2.5)
+        img_sharp = ImageEnhance.Sharpness(img_contrast).enhance(2.0)
+        return img_sharp
+    
+    def preprocess_method_2(self, img):
+        """Method 2: Moderate processing"""
+        img_gray = img.convert('L')
+        img_contrast = ImageEnhance.Contrast(img_gray).enhance(1.8)
+        img_bright = ImageEnhance.Brightness(img_contrast).enhance(1.2)
+        return img_bright
+    
+    def preprocess_method_3(self, img):
+        """Method 3: With edge enhancement"""
+        img_gray = img.convert('L')
+        img_edge = img_gray.filter(ImageFilter.EDGE_ENHANCE_MORE)
+        img_contrast = ImageEnhance.Contrast(img_edge).enhance(2.0)
+        return img_contrast
+    
+    def merge_and_add_claims(self, all_claims):
+        """
+        ✅ v3.3: NÂNG CẤP - Merge với tolerance cao hơn cho OCR
+        """
+        if not all_claims:
+            return
+        
+        sorted_claims = sorted(all_claims, key=lambda x: x['start'])
+        merged = []
+        
+        for claim in sorted_claims:
+            is_similar = False
+            
+            for existing in merged:
+                # ✅ TĂNG TOLERANCE lên 5 giây (thay vì 3)
+                # OCR có thể sai lệch vài giây
+                start_diff = abs(claim['start'] - existing['start'])
+                end_diff = abs(claim['end'] - existing['end'])
+                
+                if (start_diff <= 5 and end_diff <= 5 and
+                    claim['source'] == existing['source']):
+                    
+                    # Giữ claim có confidence cao hơn
+                    if claim['confidence'] > existing['confidence']:
+                        merged.remove(existing)
+                        merged.append(claim)
+                    is_similar = True
+                    break
+            
+            if not is_similar:
+                merged.append(claim)
+        
+        self.claims.extend(merged)
+        
+        print(f"✅ Merged {len(all_claims)} → {len(merged)} claims")
+    
+    def remove_duplicate_claims(self):
+        if not self.claims:
+            return
+        
+        unique_claims = []
+        sorted_claims = sorted(self.claims, key=lambda x: x['start'])
+        
+        for claim in sorted_claims:
+            is_duplicate = False
+            for existing in unique_claims:
+                start_diff = abs(claim['start'] - existing['start'])
+                end_diff = abs(claim['end'] - existing['end'])
+                
+                if (claim['source'] == existing['source'] and 
+                    start_diff <= 5 and end_diff <= 5):
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                unique_claims.append(claim)
+        
+        self.claims = unique_claims
+    
+    # ============================================
+    # ✅ UNIFIED VALIDATION - Cho cả OCR và Text
+    # ============================================
+    
+    def validate_claims_smart(self):
+        """
+        ✅ v3.3: VALIDATION CHUNG cho cả OCR và Text
+        Không phân biệt nguồn
+        """
+        if not self.tracklist or not self.claims:
+            return
+        
+        max_tracklist_time = max(track['end'] for track in self.tracklist)
+        valid_claims = []
+        self.ambiguous_claims = []
+        self.auto_accepted_claims = []
+        
+        for claim in self.claims:
+            # Check 1: Nằm trong range hợp lý
+            if claim['start'] > max_tracklist_time + 600:
+                print(f"⚠️ SKIP: Claim ngoài tracklist - {claim['song'][:30]}")
+                continue
+            
+            if claim['end'] > max_tracklist_time + 600:
+                claim['end'] = min(claim['end'], max_tracklist_time + 300)
+            
+            # ✅ VALIDATION ĐỒNG NHẤT
+            is_ambiguous = False
+            ambiguous_reasons = []
+            
+            # 1. Confidence check (áp dụng cho cả OCR và Text)
+            if claim['confidence'] < 50:
+                is_ambiguous = True
+                ambiguous_reasons.append(f"Low confidence: {claim['confidence']:.1f}%")
+            
+            # 2. Duration check (áp dụng cho TẤT CẢ)
+            duration = claim['end'] - claim['start']
+            if duration < 10:
+                is_ambiguous = True
+                ambiguous_reasons.append(f"Duration too short: {duration}s")
+            elif duration > 3600:
+                is_ambiguous = True
+                ambiguous_reasons.append(f"Duration too long: {duration}s")
+            
+            # 3. Tracklist matching (áp dụng cho TẤT CẢ)
+            has_match = False
+            for track in self.tracklist:
+                if self.check_claim_overlap(
+                    track['start'], track['end'],
+                    claim['start'], claim['end']
+                ):
+                    has_match = True
+                    break
+            
+            if not has_match:
+                is_ambiguous = True
+                ambiguous_reasons.append("No matching file in tracklist")
+            
+            # Phân loại
+            if is_ambiguous:
+                claim['ambiguous_reason'] = '; '.join(ambiguous_reasons)
+                self.ambiguous_claims.append(claim)
+                print(f"⚠️ AMBIGUOUS [{claim.get('source_type', '?').upper()}]: {claim['song'][:30]} - {'; '.join(ambiguous_reasons)}")
+            else:
+                self.auto_accepted_claims.append(claim)
+                print(f"✅ AUTO-ACCEPTED [{claim.get('source_type', '?').upper()}]: {claim['song'][:30]}")
+            
+            valid_claims.append(claim)
+        
+        self.claims = valid_claims
+        
+        print(f"\n📊 SUMMARY:")
+        print(f"✅ Auto-accepted: {len(self.auto_accepted_claims)} claims")
+        print(f"⚠️ Need review: {len(self.ambiguous_claims)} claims")
+        
+        self.update_review_tab()
+    
+    def update_review_tab(self):
+        for item in self.review_tree.get_children():
+            self.review_tree.delete(item)
+        
+        for idx, claim in enumerate(self.ambiguous_claims, 1):
+            time_range = f"{self.claim_parser.format_time(claim['start'])} → {self.claim_parser.format_time(claim['end'])}"
+            confidence = f"{claim['confidence']:.1f}%"
+            reason = claim.get('ambiguous_reason', 'Unknown')
+            
+            matched_files_str = "Không tìm thấy"
+            potential_matches = []
+            for track in self.tracklist:
+                if abs(track['start'] - claim['start']) < 300 or abs(track['end'] - claim['end']) < 300:
+                    potential_matches.append(track['filename'])
+            
+            if potential_matches:
+                matched_files_str = potential_matches[0][:40]
+            
+            self.review_tree.insert('', 'end', values=(
+                idx, claim['song'][:35], time_range, confidence, reason, matched_files_str
+            ))
+        
+        self.notebook.tab(1, text=f"Review Claims ({len(self.ambiguous_claims)})")
+    
+    def parse_time(self, time_str):
+        parts = time_str.split(':')
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    
+    def check_claim_overlap(self, track_start, track_end, claim_start, claim_end):
+        tolerance = 10
+        start_in_range = (claim_start >= track_start - tolerance and 
+                         claim_start <= track_end + tolerance)
+        end_in_range = (claim_end >= track_start - tolerance and 
+                       claim_end <= track_end + tolerance)
+        return start_in_range and end_in_range
+    
+    def process_claims(self):
+        if not self.tracklist:
+            messagebox.showerror("Lỗi", "Vui lòng tải file TXT trước!")
+            return
+        
+        if not self.claims:
+            messagebox.showerror("Lỗi", "Vui lòng tải ảnh claim hoặc nhập text claim!")
+            return
+        
+        self.validate_claims_smart()
+        
+        if not self.claims:
+            messagebox.showwarning("Cảnh báo", "Không có claim hợp lệ!")
+            return
+        
+        if self.ambiguous_claims:
+            response = messagebox.askquestion(
+                "Kết Quả Validate",
+                f"✅ Đã tự động chấp nhận: {len(self.auto_accepted_claims)} claims\n"
+                f"⚠️ Cần review: {len(self.ambiguous_claims)} claims\n\n"
+                f"Xem review tab?"
+            )
+            if response == 'yes':
+                self.notebook.select(1)
+                return
+        
+        self.results = []
+        claimed_tracks = []
+        
+        for claim in self.claims:
+            for track in self.tracklist:
+                if self.check_claim_overlap(track['start'], track['end'], 
+                                          claim['start'], claim['end']):
+                    claimed_tracks.append({'track': track, 'claim': claim})
+        
+        self.display_results(claimed_tracks)
+    
+    def get_base_song_name(self, filename):
+        name = filename.replace('.wav', '')
+        match = re.match(r'(\d+- [^(]+)', name)
+        if match:
+            return match.group(1).strip()
+        return name
+    
+    # ============================================
+    # ✅ UNIFIED DISPLAY - Format chuẩn cho cả OCR và Text
+    # ============================================
+    
+    def display_results(self, claimed_tracks):
+        """
+        ✅ v3.3: Hiển thị kết quả với format chuẩn
+        """
+        self.results_text.delete(1.0, tk.END)
+        
+        header = "="*140 + "\n"
+        header += "DANH SÁCH FILE WAV BỊ CLAIM - v3.3 (LOGIC ĐỒNG BỘ)\n"
+        header += "="*140 + "\n\n"
+        self.results_text.insert(tk.END, header)
+        
+        songs = {}
+        for item in claimed_tracks:
+            song = item['claim']['song']
+            if song not in songs:
+                songs[song] = []
+            songs[song].append(item)
+        
+        total_claims = 0
+        claimed_filenames = {}
+        
+        for song_name, items in songs.items():
+            self.results_text.insert(tk.END, f"\n{'='*140}\n")
+            self.results_text.insert(tk.END, f"BÀI HÁT: {song_name}\n")
+            self.results_text.insert(tk.END, f"{'='*140}\n\n")
+            
+            for idx, item in enumerate(items, 1):
+                track = item['track']
+                claim = item['claim']
+                
+                if track['filename'] not in claimed_filenames:
+                    claimed_filenames[track['filename']] = 0
+                claimed_filenames[track['filename']] += 1
+                
+                status = "✅ AUTO" if claim in self.auto_accepted_claims else "⚠️ REVIEW"
+                source_icon = "📝" if claim.get('source_type') == 'text' else "📷"
+                
+                result = f"Claim #{idx} {status} {source_icon}:\n"
+                result += f"  ⚠️ FILE BỊ CLAIM: {track['filename']}\n"
+                result += f"  📍 Thời gian file: {self.claim_parser.format_time(track['start'])} → {self.claim_parser.format_time(track['end'])}\n"
+                result += f"  🎯 Claim phát hiện: {self.claim_parser.format_time(claim['start'])} → {self.claim_parser.format_time(claim['end'])}\n"
+                result += f"  {source_icon} Nguồn: {claim['source']}\n"
+                
+                conf_icon = "✅" if claim['confidence'] >= 70 else "⚠️"
+                result += f"  {conf_icon} Confidence: {claim['confidence']:.1f}%\n"
+                
+                file_duration = max(1, track['end'] - track['start'])
+                claim_duration = max(0, claim['end'] - claim['start'])
+                claim_percent = (claim_duration / file_duration * 100) if file_duration > 0 else 0
+                
+                result += f"  📊 Tỷ lệ claim: {claim_percent:.1f}% thời lượng file\n"
+                result += f"  ✅ KHỚP: Claim nằm trong khoảng file\n\n"
+                
+                self.results_text.insert(tk.END, result)
+                total_claims += 1
+        
+        unique_filenames_tracklist = set(track['filename'] for track in self.tracklist)
+        unique_claimed = set(claimed_filenames.keys())
+        not_claimed_filenames = unique_filenames_tracklist - unique_claimed
+        
+        text_claims = len([c for c in self.claims if c.get('source_type') == 'text'])
+        ocr_claims = len([c for c in self.claims if c.get('source_type') == 'ocr'])
+        
+        summary = f"\n{'='*140}\n"
+        summary += f"TỔNG KẾT\n"
+        summary += f"{'='*140}\n"
+        summary += f"✓ Tổng file trong tracklist: {len(unique_filenames_tracklist)}\n"
+        summary += f"✓ Tổng claims phát hiện: {len(self.claims)}\n"
+        summary += f"  📝 Claims từ text: {text_claims}\n"
+        summary += f"  📷 Claims từ ảnh (OCR): {ocr_claims}\n"
+        summary += f"✅ Claims tự động chấp nhận: {len(self.auto_accepted_claims)}\n"
+        summary += f"⚠️ Claims cần review: {len(self.ambiguous_claims)}\n"
+        summary += f"⚠️ Tổng lần bị claim: {total_claims}\n"
+        summary += f"⚠️ File UNIQUE bị claim: {len(unique_claimed)}\n"
+        summary += f"✅ File KHÔNG bị claim: {len(not_claimed_filenames)}\n"
+        summary += f"📊 Tỷ lệ bị claim: {len(unique_claimed)}/{len(unique_filenames_tracklist)} "
+        summary += f"({len(unique_claimed)/len(unique_filenames_tracklist)*100:.1f}%)\n"
+        summary += f"{'='*140}\n\n"
+        
+        summary += f"{'='*140}\n"
+        summary += f"⚠️ DANH SÁCH FILE BỊ CLAIM ({len(unique_claimed)} file)\n"
+        summary += f"{'='*140}\n"
+        
+        claimed_by_song = {}
+        for filename, count in claimed_filenames.items():
+            base_name = self.get_base_song_name(filename)
+            if base_name not in claimed_by_song:
+                claimed_by_song[base_name] = []
+            claimed_by_song[base_name].append((filename, count))
+        
+        for song_id, files in sorted(claimed_by_song.items()):
+            summary += f"\n{song_id}:\n"
+            for filename, count in sorted(files):
+                summary += f"  ⚠️ {filename} ({count} lần)\n"
+        
+        summary += f"\n{'='*140}\n"
+        summary += f"✅ DANH SÁCH FILE KHÔNG BỊ CLAIM ({len(not_claimed_filenames)} file)\n"
+        summary += f"{'='*140}\n"
+        
+        not_claimed_by_song = {}
+        for filename in sorted(not_claimed_filenames):
+            base_name = self.get_base_song_name(filename)
+            if base_name not in not_claimed_by_song:
+                not_claimed_by_song[base_name] = []
+            not_claimed_by_song[base_name].append(filename)
+        
+        for song_id, files in sorted(not_claimed_by_song.items()):
+            summary += f"\n{song_id}:\n"
+            for filename in sorted(files):
+                summary += f"  ✅ {filename}\n"
+        
+        summary += f"\n{'='*140}\n"
+        
+        self.results_text.insert(tk.END, summary)
+        self.results = claimed_tracks
+    
+    def export_results(self):
+        if not self.results:
+            messagebox.showwarning("Cảnh báo", "Chưa có kết quả!")
+            return
+        
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")]
+        )
+        
+        if filepath:
+            content = self.results_text.get(1.0, tk.END)
+            with open(filepath, 'w', encoding='utf-8-sig') as f:
+                f.write(content)
+            messagebox.showinfo("Thành công", f"Đã xuất: {filepath}")
+    
+    def export_csv(self):
+        if not self.results:
+            messagebox.showwarning("Cảnh báo", "Chưa có kết quả!")
+            return
+        
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")]
+        )
+        
+        if filepath:
+            try:
+                with open(filepath, 'w', encoding='utf-8-sig', newline='') as f:
+                    f.write("File,Start,End,Claim_Start,Claim_End,Source,Song,Confidence,Percent,Status,Input_Method\n")
+                    
+                    for item in self.results:
+                        track = item['track']
+                        claim = item['claim']
+                        
+                        file_duration = max(1, track['end'] - track['start'])
+                        claim_duration = max(0, claim['end'] - claim['start'])
+                        claim_percent = (claim_duration / file_duration * 100) if file_duration > 0 else 0
+                        
+                        status = "AUTO" if claim in self.auto_accepted_claims else "REVIEW"
+                        input_method = "Text" if claim.get('source_type') == 'text' else "OCR"
+                        
+                        f.write(f'"{track["filename"]}",')
+                        f.write(f'"{self.claim_parser.format_time(track["start"])}",')
+                        f.write(f'"{self.claim_parser.format_time(track["end"])}",')
+                        f.write(f'"{self.claim_parser.format_time(claim["start"])}",')
+                        f.write(f'"{self.claim_parser.format_time(claim["end"])}",')
+                        f.write(f'"{claim["source"]}",')
+                        f.write(f'"{claim["song"]}",')
+                        f.write(f'"{claim["confidence"]:.1f}",')
+                        f.write(f'"{claim_percent:.1f}",')
+                        f.write(f'"{status}",')
+                        f.write(f'"{input_method}"\n')
+                
+                messagebox.showinfo("Thành công", f"Đã xuất CSV: {filepath}")
+            except Exception as e:
+                messagebox.showerror("Lỗi", f"Lỗi xuất CSV:\n{str(e)}")
+    
+    def export_detailed(self):
+        if not self.claims:
+            messagebox.showwarning("Cảnh báo", "Chưa có dữ liệu!")
+            return
+        
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")]
+        )
+        
+        if filepath:
+            with open(filepath, 'w', encoding='utf-8-sig') as f:
+                f.write("="*140 + "\n")
+                f.write("BÁO CÁO CHI TIẾT - v3.3\n")
+                f.write("="*140 + "\n\n")
+                
+                f.write("1. CLAIMS TỰ ĐỘNG CHẤP NHẬN\n")
+                f.write("-"*140 + "\n\n")
+                
+                for idx, claim in enumerate(self.auto_accepted_claims, 1):
+                    method = "📝 Text" if claim.get('source_type') == 'text' else "📷 OCR"
+                    f.write(f"#{idx} ({method}):\n")
+                    f.write(f"  Bài: {claim['song']}\n")
+                    f.write(f"  Time: {self.claim_parser.format_time(claim['start'])} → {self.claim_parser.format_time(claim['end'])}\n")
+                    f.write(f"  Confidence: {claim['confidence']:.1f}%\n\n")
+                
+                if self.ambiguous_claims:
+                    f.write("\n2. CLAIMS CẦN REVIEW\n")
+                    f.write("-"*140 + "\n\n")
+                    
+                    for idx, claim in enumerate(self.ambiguous_claims, 1):
+                        method = "📝 Text" if claim.get('source_type') == 'text' else "📷 OCR"
+                        f.write(f"#{idx} ({method}):\n")
+                        f.write(f"  Bài: {claim['song']}\n")
+                        f.write(f"  Time: {self.claim_parser.format_time(claim['start'])} → {self.claim_parser.format_time(claim['end'])}\n")
+                        f.write(f"  Lý do: {claim.get('ambiguous_reason', 'Unknown')}\n\n")
+                
+                text_claims = len([c for c in self.claims if c.get('source_type') == 'text'])
+                ocr_claims = len([c for c in self.claims if c.get('source_type') == 'ocr'])
+                
+                f.write("\n3. THỐNG KÊ\n")
+                f.write(f"Tổng: {len(self.claims)}\n")
+                f.write(f"Auto: {len(self.auto_accepted_claims)}\n")
+                f.write(f"Review: {len(self.ambiguous_claims)}\n")
+                f.write(f"Text: {text_claims}\n")
+                f.write(f"OCR: {ocr_claims}\n")
+                
+            messagebox.showinfo("Thành công", f"Đã xuất: {filepath}")
+    
+    def accept_claim(self):
+        selection = self.review_tree.selection()
+        if not selection:
+            messagebox.showwarning("Cảnh báo", "Chọn claim trước!")
+            return
+        
+        item = self.review_tree.item(selection[0])
+        claim_id = int(item['values'][0]) - 1
+        
+        if claim_id < len(self.ambiguous_claims):
+            claim = self.ambiguous_claims[claim_id]
+            self.auto_accepted_claims.append(claim)
+            self.ambiguous_claims.remove(claim)
+            self.update_review_tab()
+            messagebox.showinfo("OK", "Đã chấp nhận")
+    
+    def reject_claim(self):
+        selection = self.review_tree.selection()
+        if not selection:
+            messagebox.showwarning("Cảnh báo", "Chọn claim trước!")
+            return
+        
+        item = self.review_tree.item(selection[0])
+        claim_id = int(item['values'][0]) - 1
+        
+        if claim_id < len(self.ambiguous_claims):
+            claim = self.ambiguous_claims[claim_id]
+            self.ambiguous_claims.remove(claim)
+            if claim in self.claims:
+                self.claims.remove(claim)
+            self.update_review_tab()
+            messagebox.showinfo("OK", "Đã loại bỏ")
+    
+    def edit_claim(self):
+        selection = self.review_tree.selection()
+        if not selection:
+            messagebox.showwarning("Cảnh báo", "Chọn claim!")
+            return
+        
+        item = self.review_tree.item(selection[0])
+        claim_id = int(item['values'][0]) - 1
+        
+        if claim_id < len(self.ambiguous_claims):
+            claim = self.ambiguous_claims[claim_id]
+            
+            edit_window = tk.Toplevel(self.root)
+            edit_window.title("Chỉnh Sửa")
+            edit_window.geometry("500x250")
+            
+            ttk.Label(edit_window, text="Bài hát:").grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+            song_var = tk.StringVar(value=claim['song'])
+            ttk.Entry(edit_window, textvariable=song_var, width=50).grid(row=0, column=1, padx=10)
+            
+            ttk.Label(edit_window, text="Start (s):").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+            start_var = tk.IntVar(value=claim['start'])
+            ttk.Entry(edit_window, textvariable=start_var, width=50).grid(row=1, column=1, padx=10)
+            
+            ttk.Label(edit_window, text="End (s):").grid(row=2, column=0, sticky=tk.W, padx=10, pady=5)
+            end_var = tk.IntVar(value=claim['end'])
+            ttk.Entry(edit_window, textvariable=end_var, width=50).grid(row=2, column=1, padx=10)
+            
+            def save():
+                claim['song'] = song_var.get()
+                claim['start'] = start_var.get()
+                claim['end'] = end_var.get()
+                self.update_review_tab()
+                edit_window.destroy()
+                messagebox.showinfo("OK", "Đã cập nhật")
+            
+            ttk.Button(edit_window, text="Lưu", command=save).grid(row=3, column=0, columnspan=2, pady=15)
+    
+    def accept_all_claims(self):
+        if not self.ambiguous_claims:
+            messagebox.showinfo("Thông báo", "Không có claim nào")
+            return
+        
+        confirm = messagebox.askyesno("Xác nhận", f"Chấp nhận {len(self.ambiguous_claims)} claims?")
+        if confirm:
+            self.auto_accepted_claims.extend(self.ambiguous_claims)
+            self.ambiguous_claims = []
+            self.update_review_tab()
+            messagebox.showinfo("OK", "Đã chấp nhận tất cả")
+    
+    def reprocess_claims(self):
+        if not self.claims:
+            messagebox.showwarning("Cảnh báo", "Không có claims")
+            return
+        
+        self.ambiguous_claims = []
+        self.notebook.select(0)
+        self.process_claims()
+
+
+# ============================================================================
+# MAIN FUNCTION
+# ============================================================================
+
+def main():
+    root = tk.Tk()
+    app = ClaimCheckerApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

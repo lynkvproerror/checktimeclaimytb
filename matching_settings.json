@@ -1,0 +1,12 @@
+{
+  "name_similarity_auto_accept": 85,
+  "name_similarity_need_review": 50,
+  "name_similarity_reject": 0,
+  "overlap_percent_auto_accept": 60,
+  "overlap_percent_need_review": 40,
+  "overlap_percent_reject": 0,
+  "min_absolute_duration": 15,
+  "frequency_rescue_threshold": 5,
+  "frequency_rescue_min_overlap": 20,
+  "ocr_confidence_threshold": 20
+}

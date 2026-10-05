@@ -1,0 +1,20 @@
+{
+  "audio_files": [],
+  "media_files": [],
+  "output_dir": ".",
+  "video_type": "Màn Hình Đen",
+  "resolution": "1920x1080",
+  "fps": "30",
+  "codec": "libx264",
+  "loop_playlist": false,
+  "target_hours": "0",
+  "target_minutes": "30",
+  "randomize_playlist": true,
+  "random_media": false,
+  "image_duration": "5",
+  "video_speed": "1.0",
+  "compilation_name": "Claim_Check_Compilation",
+  "playlist_seed": "",
+  "preset_name": "🎬 YouTube Standard",
+  "auto_load_tracklist": true
+}

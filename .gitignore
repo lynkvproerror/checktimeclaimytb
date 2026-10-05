@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+*.spec
+
+# Credentials & Sensitive Files
+client_secret*.json
+*token*.json
+youtube_oauth_token.json
+youtube_api_settings.json
+generator_settings.json
+*.env
+*.env.*
+*.pem
+*.key
+
+# Large Binaries, Installers & Media
+*.exe
+*.zip
+*.tar.gz
+*.7z
+*.rar
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.wav
+*.mp3
+*.flac
+*.m4a
+tesseract-ocr-*
+
+# Application Output & History
+claim_history/
+Claim_Check_Test*/
+_workflow_jobs/
+*.log
+
+# OS & IDE Files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
